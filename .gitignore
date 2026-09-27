@@ -1,0 +1,29 @@
+# Local database (machine-specific paths)
+drums.db
+*.db
+*.sqlite3
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Temporary audio files
+*.wav
+!tests/*.wav
+drum_matcher_slice.wav
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
