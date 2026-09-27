@@ -1,313 +1,333 @@
 """
-matcher.py - High-Precision Drum Sample Matcher with 24-Band Mel Micro-Timbre.
+matcher.py - V2 producer-oriented replacement matcher.
+
+Ranking goal:
+    "Which sample would I actually use to remake this hit?"
+not:
+    "Which file is mathematically closest in raw acoustics?"
+
+The ranking is intentionally inspectable. A later CLAP/embedding model can be
+added as a reranker without replacing these features.
 """
 
-import os
-import sys
-import math
-import json
-import sqlite3
 import argparse
-import winsound
+import json
+import math
+import os
+import sqlite3
+
 import numpy as np
-from audio_features import extract_features, load_audio, debleed_audio
+
+from audio_features import extract_features
 
 
 DB_NAME = "drums.db"
+ROLE_FAMILY = {
+    "kick": ("kick", "808"),
+    "808": ("808", "kick"),
+    "snare": ("snare", "clap", "rim"),
+    "clap": ("clap", "snare", "rim"),
+    "rim": ("rim", "snare", "clap"),
+    "hat": ("hat",),
+    "perc": ("perc", "rim", "hat"),
+    "other": ("other", "kick", "snare", "hat", "perc"),
+}
 
 
-def cosine_sim_3(v1, v2):
-    dot = v1[0]*v2[0] + v1[1]*v2[1] + v1[2]*v2[2]
-    norm1 = math.sqrt(v1[0]**2 + v1[1]**2 + v1[2]**2) + 1e-9
-    norm2 = math.sqrt(v2[0]**2 + v2[1]**2 + v2[2]**2) + 1e-9
-    return float(np.clip(dot / (norm1 * norm2), 0.0, 1.0))
+def _gaussian(delta, scale):
+    return float(math.exp(-((float(delta) / max(scale, 1e-6)) ** 2)))
 
 
-def cosine_sim_mel(v1, v2):
-    """
-    Computes cosine similarity between two 24-band Mel vectors.
-    """
-    if len(v1) != len(v2) or len(v1) == 0:
-        return 0.5
-    dot = float(np.dot(v1, v2))
-    norm1 = float(np.linalg.norm(v1)) + 1e-9
-    norm2 = float(np.linalg.norm(v2)) + 1e-9
-    return float(np.clip(dot / (norm1 * norm2), 0.0, 1.0))
+def _cosine(a, b):
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    if len(a) != len(b) or len(a) == 0:
+        return 0.0
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na < 1e-9 or nb < 1e-9:
+        return 0.0
+    return float(np.clip(np.dot(a, b) / (na * nb), -1.0, 1.0))
 
 
-def compute_similarity(ref, cand, category='snare', modifier=None):
-    cat = category.lower()
+def _load_json(value, fallback):
+    try:
+        parsed = json.loads(value) if value else fallback
+        return parsed if parsed is not None else fallback
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return fallback
 
-    # 1. Attack Dynamics (Crest Factor + Log-Attack Rise Time)
-    crest_diff = abs(ref['crest_db'] - cand['crest_db'])
-    sim_crest = math.exp(- (crest_diff / 4.5) ** 2)
 
-    lat_diff = abs(ref['lat'] - cand['lat'])
-    sim_lat = math.exp(- (lat_diff / 0.5) ** 2)
+def _pitch_similarity(ref, cand, category):
+    if category not in ("kick", "808", "snare", "clap", "rim"):
+        return 0.5, 0
 
-    sim_attack = 0.60 * sim_crest + 0.40 * sim_lat
+    rf = max(float(ref.get("f_sub", 0.0)), 20.0)
+    cf = max(float(cand.get("f_sub", 0.0)), 20.0)
 
-    # 2. Pitch & Fundamental Contour
-    if cat in ('kick', '808'):
-        ref_sub = max(ref['f_sub'], 20.0)
-        cand_sub = max(cand['f_sub'], 20.0)
-        sub_cents = abs(1200.0 * math.log2(cand_sub / ref_sub))
-        sim_sub = math.exp(- (sub_cents / 220.0) ** 2)
+    cents = abs(1200.0 * math.log2(cf / rf))
+    sim = _gaussian(cents, 180.0 if category in ("kick", "808") else 260.0)
 
-        drop_diff = abs(ref['pitch_drop_st'] - cand['pitch_drop_st'])
-        sim_drop = math.exp(- (drop_diff / 6.0) ** 2)
+    if category in ("kick", "808"):
+        drop = abs(float(ref.get("pitch_drop_st", 0.0)) - float(cand.get("pitch_drop_st", 0.0)))
+        sim = 0.72 * sim + 0.28 * _gaussian(drop, 5.5)
 
-        ref_top = max(ref['f_top'], 50.0)
-        cand_top = max(cand['f_top'], 50.0)
-        top_cents = abs(1200.0 * math.log2(cand_top / ref_top))
-        sim_top = math.exp(- (top_cents / 500.0) ** 2)
+    tuning = int(round(1200.0 * math.log2(rf / cf)))
+    return float(np.clip(sim, 0.0, 1.0)), tuning
 
-        sim_pitch = 0.55 * sim_sub + 0.30 * sim_drop + 0.15 * sim_top
-        tuning_cents = round(1200.0 * math.log2(ref_sub / cand_sub))
-    else:
-        ref_f0 = max(ref['f_sub'], 20.0)
-        cand_f0 = max(cand['f_sub'], 20.0)
-        cents_diff = abs(1200.0 * math.log2(cand_f0 / ref_f0))
-        sim_pitch = math.exp(- (cents_diff / 250.0) ** 2)
-        tuning_cents = round(1200.0 * math.log2(ref_f0 / cand_f0))
 
-    # 3. 24-Band Mel Micro-Timbre
-    cand_mel = cand.get('mel24')
-    if cand_mel is None and 'mel24_json' in cand and cand['mel24_json']:
-        try:
-            cand_mel = json.loads(cand['mel24_json'])
-        except Exception:
-            cand_mel = [0.0] * 24
+def _role_compatibility(ref, cand):
+    ref_probs = _load_json(ref.get("category_probs_json"), {})
+    cand_probs = _load_json(cand.get("category_probs_json"), {})
 
-    ref_mel = ref.get('mel24', [0.0] * 24)
-    if cand_mel and len(cand_mel) == 24 and len(ref_mel) == 24:
-        sim_mel24 = cosine_sim_mel(ref_mel, cand_mel)
-    else:
-        sim_mel24 = 0.70
+    if not ref_probs or not cand_probs:
+        return 1.0
 
-    # 4. Attack Frequency Distribution (Low / Mid / High)
-    v_ref_att = (ref['att_low'], ref['att_mid'], ref['att_high'])
-    v_cand_att = (cand['att_low'], cand['att_mid'], cand['att_high'])
-    sim_att_bands = cosine_sim_3(v_ref_att, v_cand_att)
+    # Dot product of role affinities is softer than a hard category gate.
+    keys = set(ref_probs) | set(cand_probs)
+    score = sum(float(ref_probs.get(k, 0.0)) * float(cand_probs.get(k, 0.0)) for k in keys)
+    return float(np.clip(score * 6.0, 0.0, 1.0))
 
-    # 5. Sustain Texture & Wires
-    v_ref_sus = (ref['sus_low'], ref['sus_mid'], ref['sus_high'])
-    v_cand_sus = (cand['sus_low'], cand['sus_mid'], cand['sus_high'])
-    sim_sus_bands = cosine_sim_3(v_ref_sus, v_cand_sus)
 
-    noise_diff = abs(ref['noise_ratio'] - cand['noise_ratio'])
-    sim_noise = max(0.0, 1.0 - (noise_diff / 0.5))
-    sim_sustain = 0.65 * sim_sus_bands + 0.35 * sim_noise
+def compute_similarity(ref, cand, category=None, modifier=None):
+    category = (category or ref.get("category") or "other").lower()
 
-    # 6. Decay Time Envelope
-    ref_dec = max(ref['decay_ms'], 5.0)
-    cand_dec = max(cand['decay_ms'], 5.0)
-    decay_ratio = abs(math.log(cand_dec / ref_dec))
-    sim_decay = math.exp(- (decay_ratio / 0.5) ** 2)
+    ref_mel = _load_json(ref.get("mel24_json"), ref.get("mel24", []))
+    cand_mel = _load_json(cand.get("mel24_json"), cand.get("mel24", []))
+    ref_band = _load_json(ref.get("band_profile_json"), [])
+    cand_band = _load_json(cand.get("band_profile_json"), [])
 
-    # Category Weights with Mel Micro-Timbre
-    if cat in ('kick', '808'):
-        weights = {
-            'pitch': 0.30,
-            'mel24': 0.25,
-            'attack': 0.20,
-            'decay': 0.15,
-            'att_bands': 0.10
-        }
-    elif cat in ('snare', 'clap', 'rim'):
-        weights = {
-            'mel24': 0.25,
-            'attack': 0.22,
-            'pitch': 0.20,
-            'sustain': 0.18,
-            'decay': 0.15
-        }
-    elif cat == 'hat':
-        weights = {
-            'mel24': 0.30,
-            'decay': 0.30,
-            'sustain': 0.25,
-            'attack': 0.15,
-            'pitch': 0.00
-        }
-    else:
-        weights = {
-            'mel24': 0.25,
-            'attack': 0.20,
-            'pitch': 0.20,
-            'sustain': 0.18,
-            'decay': 0.17
-        }
+    # 1) Attack: what makes the hit "speak"?
+    attack_crest = _gaussian(
+        float(ref.get("crest_db", 0.0)) - float(cand.get("crest_db", 0.0)), 4.0
+    )
+    attack_time = _gaussian(
+        float(ref.get("attack_time_ms", 1.0)) - float(cand.get("attack_time_ms", 1.0)), 2.8
+    )
+    attack_shape = _gaussian(
+        float(ref.get("attack_ratio", 0.0)) - float(cand.get("attack_ratio", 0.0)), 0.13
+    )
+    sim_attack = 0.45 * attack_crest + 0.35 * attack_time + 0.20 * attack_shape
 
-    # Relative Modifiers
-    if modifier == 'punchier':
-        weights['attack'] *= 2.0
-    elif modifier == 'tighter':
-        weights['decay'] *= 2.0
-    elif modifier == 'darker':
-        weights['mel24'] *= 1.5
-    elif modifier == 'brighter':
-        weights['mel24'] *= 1.5
+    # 2) Body: the part that usually determines whether a replacement feels right.
+    body_shape = _gaussian(
+        float(ref.get("body_ratio", 0.0)) - float(cand.get("body_ratio", 0.0)), 0.13
+    )
+    body_rms = _gaussian(
+        float(ref.get("body_rms", 0.0)) - float(cand.get("body_rms", 0.0)), 0.12
+    )
+    body_spectrum = _cosine(
+        ref_band[:5], cand_band[:5]
+    ) if len(ref_band) >= 5 and len(cand_band) >= 5 else 0.5
+    sim_body = 0.45 * body_shape + 0.25 * body_rms + 0.30 * body_spectrum
 
-    w_sum = sum(weights.values())
-    weights = {k: v / w_sum for k, v in weights.items()}
+    # 3) Tail/decay: especially important for hats, snares and roomy percussion.
+    decay = _gaussian(
+        math.log(max(float(ref.get("decay_ms", 5.0)), 5.0) /
+                 max(float(cand.get("decay_ms", 5.0)), 5.0)), 0.38
+    )
+    tail_shape = _gaussian(
+        float(ref.get("tail_ratio", 0.0)) - float(cand.get("tail_ratio", 0.0)), 0.10
+    )
+    sim_tail = 0.70 * decay + 0.30 * tail_shape
 
-    total_score = (
-        weights['attack'] * sim_attack +
-        weights.get('pitch', 0.0) * sim_pitch +
-        weights['mel24'] * sim_mel24 +
-        weights.get('sustain', 0.0) * sim_sustain +
-        weights['decay'] * sim_decay
+    # 4) Timbre contour: useful, but deliberately not allowed to dominate.
+    sim_mel = _cosine(ref_mel, cand_mel) if len(ref_mel) == len(cand_mel) and ref_mel else 0.5
+
+    # 5) Noise/wire character and broad spectral distribution.
+    noise = _gaussian(
+        float(ref.get("noise_ratio", 0.0)) - float(cand.get("noise_ratio", 0.0)), 0.18
+    )
+    sim_band = _cosine(ref_band, cand_band) if len(ref_band) == len(cand_band) and ref_band else 0.5
+    sim_texture = 0.55 * noise + 0.45 * sim_band
+
+    # 6) Role-specific pitch.
+    sim_pitch, tuning_cents = _pitch_similarity(ref, cand, category)
+
+    role = _role_compatibility(ref, cand)
+
+    # Category weights encode how beatmakers tend to hear replacement identity.
+    weights = {
+        "attack": 0.28,
+        "body": 0.26,
+        "tail": 0.18,
+        "timbre": 0.16,
+        "texture": 0.08,
+        "pitch": 0.04,
+    }
+
+    if category in ("kick", "808"):
+        weights.update(attack=0.24, body=0.29, tail=0.16, timbre=0.12, texture=0.06, pitch=0.13)
+    elif category in ("snare", "clap", "rim"):
+        weights.update(attack=0.28, body=0.22, tail=0.18, timbre=0.17, texture=0.11, pitch=0.04)
+    elif category == "hat":
+        weights.update(attack=0.20, body=0.12, tail=0.30, timbre=0.22, texture=0.16, pitch=0.0)
+    elif category == "perc":
+        weights.update(attack=0.24, body=0.23, tail=0.22, timbre=0.18, texture=0.13, pitch=0.0)
+
+    # Modifiers are ranking biases, not destructive transforms.
+    if modifier == "punchier":
+        weights["attack"] *= 1.55
+        weights["body"] *= 0.85
+    elif modifier == "tighter":
+        weights["tail"] *= 1.60
+        weights["body"] *= 0.90
+    elif modifier in ("darker", "brighter"):
+        weights["timbre"] *= 1.45
+        weights["texture"] *= 0.90
+
+    total_weight = sum(weights.values())
+    weights = {k: v / total_weight for k, v in weights.items()}
+
+    total = (
+        weights["attack"] * sim_attack +
+        weights["body"] * sim_body +
+        weights["tail"] * sim_tail +
+        weights["timbre"] * sim_mel +
+        weights["texture"] * sim_texture +
+        weights["pitch"] * sim_pitch
     )
 
+    # Role mismatch is a soft penalty, not an all-or-nothing exclusion.
+    total *= 0.78 + 0.22 * role
+
     return {
-        'total': total_score,
-        'sim_attack': sim_attack,
-        'sim_pitch': sim_pitch,
-        'sim_mel24': sim_mel24,
-        'sim_att_bands': sim_att_bands,
-        'sim_sustain': sim_sustain,
-        'sim_decay': sim_decay,
-        'tuning_cents': tuning_cents
+        "total": float(np.clip(total, 0.0, 1.0)),
+        "sim_attack": float(sim_attack),
+        "sim_body": float(sim_body),
+        "sim_tail": float(sim_tail),
+        "sim_mel24": float(sim_mel),
+        "sim_texture": float(sim_texture),
+        "sim_pitch": float(sim_pitch),
+        "role_compatibility": float(role),
+        "tuning_cents": tuning_cents,
+        "reason": {
+            "attack": round(sim_attack, 3),
+            "body": round(sim_body, 3),
+            "tail": round(sim_tail, 3),
+            "timbre": round(sim_mel, 3),
+            "texture": round(sim_texture, 3),
+            "pitch": round(sim_pitch, 3),
+        },
     }
 
 
-def match_sample(ref_target, category=None, top_k=10, db_path=DB_NAME, modifier=None, apply_debleed=False, sample_type='oneshot'):
+def _target_categories(category):
+    return ROLE_FAMILY.get(category, ROLE_FAMILY["other"])
+
+
+def _candidate_rows(conn, category, sample_type):
+    placeholders = ",".join("?" for _ in _target_categories(category))
+    args = list(_target_categories(category))
+    where = f"category IN ({placeholders})"
+
+    if sample_type == "oneshot":
+        where += " AND COALESCE(is_loop, 0) = 0"
+    elif sample_type == "loop":
+        where += " AND COALESCE(is_loop, 0) = 1"
+
+    cur = conn.cursor()
+    cur.execute(f"SELECT * FROM samples WHERE {where}", args)
+    return cur.fetchall()
+
+
+def _prefilter(rows, ref, category, limit=2500):
     """
-    Matches reference audio (either file path OR in-memory slice numpy array).
-    sample_type: 'oneshot' (default), 'loop', or 'all'
+    Cheap coarse gate before the detailed score.
+
+    It deliberately keeps a generous pool so an unusual but musically useful
+    sample is not thrown away too early.
     """
+    scored = []
+    rf = float(ref.get("f_sub", 0.0))
+    rc = float(ref.get("centroid", 0.0))
+    rd = max(float(ref.get("decay_ms", 10.0)), 5.0)
+
+    for row in rows:
+        c = dict(row)
+        cf = float(c.get("f_sub", 0.0))
+        cc = float(c.get("centroid", 0.0))
+        cd = max(float(c.get("decay_ms", 10.0)), 5.0)
+
+        pitch = _gaussian(abs(1200.0 * math.log2(max(cf, 20.0) / max(rf, 20.0))), 900.0)
+        centroid = _gaussian(rc - cc, 3000.0)
+        decay = _gaussian(math.log(rd / cd), 1.0)
+
+        role = _role_compatibility(ref, c)
+        coarse = 0.45 * pitch + 0.30 * centroid + 0.25 * decay
+        coarse *= 0.75 + 0.25 * role
+        scored.append((coarse, c))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in scored[:limit]]
+
+
+def match_sample(
+    ref_target,
+    category=None,
+    top_k=10,
+    db_path=DB_NAME,
+    modifier=None,
+    apply_debleed=False,
+    sample_type="oneshot",
+):
     if isinstance(ref_target, str):
         if not os.path.exists(ref_target):
-            print(f"Error: File not found: {ref_target}")
-            return [], {}
-        ref_feats = extract_features(ref_target, category=category, apply_debleed=apply_debleed)
-        ref_title = os.path.basename(ref_target)
+            raise FileNotFoundError(ref_target)
+        ref = extract_features(ref_target, category=category, apply_debleed=apply_debleed)
+        title = os.path.basename(ref_target)
     else:
-        ref_feats = extract_features(ref_target, sr=44100, category=category, apply_debleed=apply_debleed)
-        ref_title = "Selected Audio Slice"
+        ref = extract_features(
+            ref_target, sr=44100, category=category, apply_debleed=apply_debleed
+        )
+        title = "Selected Audio Slice"
 
     if not os.path.exists(db_path):
-        print(f"Error: Database '{db_path}' not found. Please run indexer.py first.")
-        return [], {}
-
-    cat = ref_feats['category']
-
-    print("\n" + "=" * 68)
-    print(f"🎯 REFERENCE HIT: {ref_title}")
-    print(f"   Category     : {cat.upper()}{' [DE-BLEEDED]' if apply_debleed else ''} | Type Filter: {sample_type.upper()}")
-    print(f"   Onset Offset : {ref_feats['onset_time_ms']} ms (Pre-delay trimmed)")
-    print(f"   Attack Punch : {ref_feats['crest_db']} dB Crest | Rise-Time: {ref_feats['attack_time_ms']} ms")
-    if cat in ('kick', '808'):
-        print(f"   Sub Fund.    : {ref_feats['f_sub']} Hz | Click: {ref_feats['f_top']} Hz (Sweep: -{ref_feats['pitch_drop_st']} st)")
-    else:
-        print(f"   Body Fund.   : {ref_feats['f_sub']} Hz (Confidence: {int(ref_feats['f0_conf']*100)}%)")
-    print(f"   Decay T30    : {ref_feats['decay_ms']} ms | Noise: {int(ref_feats['noise_ratio']*100)}%")
-    if modifier:
-        print(f"   Modifier     : +{modifier.upper()}")
-    print("=" * 68)
+        raise FileNotFoundError(
+            f"Database '{db_path}' not found. Index a drum-kit folder first."
+        )
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
 
-    if cat == 'snare':
-        target_cats = ('snare', 'clap', 'rim')
-    elif cat in ('clap', 'rim'):
-        target_cats = ('clap', 'rim', 'snare')
-    elif cat in ('kick', '808'):
-        target_cats = ('kick', '808')
-    elif cat == 'hat':
-        target_cats = ('hat',)
-    else:
-        target_cats = (cat,)
+    rows = _candidate_rows(conn, ref["category"], sample_type)
+    if not rows and sample_type != "all":
+        # Never fail silently when the user's library has incomplete metadata.
+        rows = _candidate_rows(conn, ref["category"], "all")
 
-    placeholders = ','.join('?' * len(target_cats))
-    
-    if sample_type == 'oneshot':
-        query = f"SELECT * FROM samples WHERE category IN ({placeholders}) AND is_loop = 0"
-        cur.execute(query, target_cats)
-    elif sample_type == 'loop':
-        query = f"SELECT * FROM samples WHERE category IN ({placeholders}) AND is_loop = 1"
-        cur.execute(query, target_cats)
-    else:
-        query = f"SELECT * FROM samples WHERE category IN ({placeholders})"
-        cur.execute(query, target_cats)
+    candidates = _prefilter(rows, ref, ref["category"])
+    ranked = []
 
-    candidates = cur.fetchall()
-
-    if not candidates:
-        if sample_type == 'oneshot':
-            cur.execute("SELECT * FROM samples WHERE is_loop = 0")
-        elif sample_type == 'loop':
-            cur.execute("SELECT * FROM samples WHERE is_loop = 1")
-        else:
-            cur.execute("SELECT * FROM samples")
-        candidates = cur.fetchall()
-
-    conn.close()
-
-    results = []
     for row in candidates:
         cand = dict(row)
-        sims = compute_similarity(ref_feats, cand, category=cat, modifier=modifier)
-        results.append((sims['total'], cand, sims))
+        sims = compute_similarity(ref, cand, ref["category"], modifier)
+        ranked.append((sims["total"], cand, sims))
 
-    results.sort(key=lambda x: x[0], reverse=True)
-    return results[:top_k], ref_feats
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    conn.close()
 
-
-
-def print_matches(matches, ref_feats):
-    if not matches:
-        print("No matches found.")
-        return
-
-    print(f"\nTop {len(matches)} Closest Drum Matches from Your Library:\n")
-
-    for rank, (score, cand, sims) in enumerate(matches, 1):
-        pct = round(score * 100, 1)
-        tuning = sims['tuning_cents']
-        if abs(tuning) < 15:
-            tune_str = "in-key"
-        elif tuning > 0:
-            tune_str = f"tune +{round(tuning/100, 1)} st"
-        else:
-            tune_str = f"tune {round(tuning/100, 1)} st"
-
-        is_kick = cand['category'] in ('kick', '808')
-        tone_str = f"{cand['f_sub']} Hz ({tune_str})"
-        if is_kick and cand['pitch_drop_st'] > 0:
-            tone_str += f" [drop -{cand['pitch_drop_st']} st]"
-
-        print(f"#{rank:<2} [{pct}% Match] {cand['filename']} ({cand['kit_name']})")
-        print(f"    ├── Attack Snap & Rise : {int(sims['sim_attack']*100)}% ({cand['crest_db']} dB, {cand['attack_time_ms']} ms)")
-        print(f"    ├── Tone & Resonance   : {int(sims['sim_pitch']*100)}% ({tone_str})")
-        print(f"    ├── Mel Micro-Timbre   : {int(sims['sim_mel24']*100)}% (24-Band Contour)")
-        print(f"    ├── Sustain & Wires    : {int(sims['sim_sustain']*100)}% ({int(cand['noise_ratio']*100)}% noise)")
-        print(f"    └── Decay Length       : {int(sims['sim_decay']*100)}% ({cand['decay_ms']} ms)")
-        print()
+    return ranked[:max(1, int(top_k))], ref
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Match a reference drum hit to your local drum library")
-    parser.add_argument("reference", help="Path to reference audio file (.wav)")
-    parser.add_argument("--category", "-c", choices=['kick', 'snare', 'clap', 'rim', 'hat', '808', 'perc', 'auto'], default='auto')
-    parser.add_argument("--type", "-t", choices=['oneshot', 'loop', 'all'], default='oneshot', help="Filter by sample type (default: oneshot)")
-    parser.add_argument("--top", "-n", type=int, default=10, help="Number of results (default 10)")
-    parser.add_argument("--modifier", "-m", choices=['punchier', 'tighter', 'darker', 'brighter'], help="Relative modifier")
-    parser.add_argument("--debleed", action="store_true", help="Apply spectral de-bleeding for song slices")
-    parser.add_argument("--no-audition", action="store_true", help="Skip interactive audition prompt")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Find usable replacement drum samples.")
+    parser.add_argument("reference")
+    parser.add_argument("--db", default=DB_NAME)
+    parser.add_argument("--category", default=None)
+    parser.add_argument("--top", type=int, default=10)
+    parser.add_argument("--type", choices=("oneshot", "loop", "all"), default="oneshot")
     args = parser.parse_args()
 
-    matches, ref_feats = match_sample(
-        args.reference,
-        category=None if args.category == 'auto' else args.category,
-        top_k=args.top,
-        modifier=args.modifier,
-        apply_debleed=args.debleed,
-        sample_type=args.type
+    matches, ref = match_sample(
+        args.reference, category=args.category, top_k=args.top,
+        db_path=args.db, sample_type=args.type
     )
-
-    print_matches(matches, ref_feats)
-
+    print(f"\nReference: {ref['filename']} | role={ref['category']} "
+          f"| confidence={ref['category_confidence']:.2f}")
+    for rank, (score, cand, sims) in enumerate(matches, 1):
+        print(
+            f"{rank:2}. {score*100:5.1f}%  {cand['filename']}  "
+            f"[{cand['kit_name']}]  {cand['category']}  "
+            f"A:{sims['sim_attack']:.2f} B:{sims['sim_body']:.2f} "
+            f"T:{sims['sim_tail']:.2f} D:{sims['sim_mel24']:.2f}"
+        )
