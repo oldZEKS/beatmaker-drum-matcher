@@ -18,7 +18,7 @@ import sqlite3
 
 import numpy as np
 
-from audio_features import extract_features
+from audio_features import detect_all_onsets, extract_features, load_audio
 
 
 DB_NAME = "drums.db"
@@ -270,17 +270,55 @@ def match_sample(
     modifier=None,
     apply_debleed=False,
     sample_type="oneshot",
+    time_range=None,
+    slice_idx=None,
 ):
+    """
+    Match a reference sample or portion against the local drum database.
+
+    ref_target: file path (str) or numpy audio array.
+    time_range: optional (start_sec, end_sec) tuple to extract a portion.
+    slice_idx: optional 0-indexed detected onset slice.
+    """
     if isinstance(ref_target, str):
         if not os.path.exists(ref_target):
             raise FileNotFoundError(ref_target)
-        ref = extract_features(ref_target, category=category, apply_debleed=apply_debleed)
-        title = os.path.basename(ref_target)
+
+        if time_range is not None or slice_idx is not None:
+            data, sr = load_audio(ref_target)
+            if time_range is not None:
+                start_s, end_s = time_range
+                s_idx = max(0, int(start_s * sr))
+                e_idx = min(len(data), int(end_s * sr))
+                ref_audio = data[s_idx:e_idx] if e_idx > s_idx else data
+            else:
+                slices = detect_all_onsets(data, sr)
+                if not (0 <= slice_idx < len(slices)):
+                    raise IndexError(
+                        f"Slice index {slice_idx} out of range (detected {len(slices)} slices)."
+                    )
+                s_idx, e_idx = slices[slice_idx]
+                ref_audio = data[s_idx:e_idx]
+
+            ref = extract_features(
+                ref_audio, sr=sr, category=category, apply_debleed=apply_debleed
+            )
+            title = f"{os.path.basename(ref_target)} [Portion {s_idx/sr:.2f}s–{e_idx/sr:.2f}s]"
+        else:
+            ref = extract_features(ref_target, category=category, apply_debleed=apply_debleed)
+            title = os.path.basename(ref_target)
     else:
+        ref_audio = np.asarray(ref_target, dtype=np.float32)
+        if time_range is not None:
+            sr = 44100
+            start_s, end_s = time_range
+            s_idx = max(0, int(start_s * sr))
+            e_idx = min(len(ref_audio), int(end_s * sr))
+            ref_audio = ref_audio[s_idx:e_idx] if e_idx > s_idx else ref_audio
         ref = extract_features(
-            ref_target, sr=44100, category=category, apply_debleed=apply_debleed
+            ref_audio, sr=44100, category=category, apply_debleed=apply_debleed
         )
-        title = "Selected Audio Slice"
+        title = "Selected Audio"
 
     if not os.path.exists(db_path):
         raise FileNotFoundError(
@@ -316,14 +354,62 @@ if __name__ == "__main__":
     parser.add_argument("--category", default=None)
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--type", choices=("oneshot", "loop", "all"), default="oneshot")
+    parser.add_argument(
+        "--scope",
+        choices=("whole", "portion", "auto"),
+        default="auto",
+        help="Compare the whole sample or an isolated portion",
+    )
+    parser.add_argument(
+        "--portion",
+        nargs=2,
+        type=float,
+        metavar=("START", "END"),
+        default=None,
+        help="Explicit portion range in seconds (e.g. --portion 0.15 0.45)",
+    )
+    parser.add_argument(
+        "--slice",
+        type=int,
+        default=None,
+        help="1-indexed detected onset hit (e.g. --slice 1)",
+    )
+    parser.add_argument(
+        "--modifier",
+        choices=("punchier", "tighter", "darker", "brighter"),
+        default=None,
+        help="Biasing preference for ranking",
+    )
+    parser.add_argument(
+        "--debleed",
+        action="store_true",
+        help="Apply percussive focus filter to reduce bleed in mix excerpts",
+    )
     args = parser.parse_args()
 
+    slice_param = (args.slice - 1) if args.slice is not None else None
+    time_range_param = tuple(args.portion) if args.portion else None
+
+    # Auto scope resolution
+    if args.scope == "portion" and slice_param is None and time_range_param is None:
+        slice_param = 0  # Default to first detected hit in portion mode
+
     matches, ref = match_sample(
-        args.reference, category=args.category, top_k=args.top,
-        db_path=args.db, sample_type=args.type
+        args.reference,
+        category=args.category,
+        top_k=args.top,
+        db_path=args.db,
+        modifier=args.modifier,
+        apply_debleed=args.debleed,
+        sample_type=args.type,
+        time_range=time_range_param,
+        slice_idx=slice_param,
     )
-    print(f"\nReference: {ref['filename']} | role={ref['category']} "
-          f"| confidence={ref['category_confidence']:.2f}")
+
+    print(
+        f"\nReference: {ref['filename']} | role={ref['category']} "
+        f"| confidence={ref['category_confidence']:.2f} | duration={ref['duration_ms']:.1f}ms | decay={ref['decay_ms']:.1f}ms"
+    )
     for rank, (score, cand, sims) in enumerate(matches, 1):
         print(
             f"{rank:2}. {score*100:5.1f}%  {cand['filename']}  "

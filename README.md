@@ -41,6 +41,33 @@ song / loop / hit → onset detection → selected hit → acoustic drum-role an
 
 The V2 engine intentionally keeps the deterministic ranking interpretable. A neural audio embedding/reranker can be added later without replacing these features.
 
+## Whole Sample vs. Portion Comparison
+
+You can toggle whether the engine analyzes the **entire sample** or an **isolated portion/slice**:
+- **⛶ Whole Sample**: Analyzes the complete audio file with its full decay, body, and tail. Essential when matching 808s, sustained kicks, cymbals, or unchopped one-shots.
+- **✂ Portion / Slice**: Analyzes an isolated transient hit or a custom dragged time region. Essential when sampling from full drum loops, song excerpts, or stems.
+- **Waveform Drag**: Click and drag across any area of the waveform to define a custom time window.
+- **Shortcut `W`**: Quickly toggle between Whole Sample and Portion mode.
+
+### CLI Examples
+
+    # Match the entire sample (full decay & tail)
+    python matcher.py "C:\path\to\808.wav" --scope whole
+
+    # Match an isolated hit from a drum loop by slice index
+    python matcher.py "C:\path\to\drum_loop.wav" --slice 1
+
+    # Match a specific custom time portion (e.g. 0.15s to 0.45s)
+    python matcher.py "C:\path\to\song.wav" --portion 0.15 0.45
+
+## GUI Shortcuts
+
+- **`W`**: Toggle between Whole Sample and Portion mode
+- **`Space`**: Audition active target (whole sample or selected portion)
+- **`R`**: Audition full source audio
+- **`Left` / `Right`**: Step between detected transient hits in portion mode
+- **`Drag to DAW`**: Drag any matched candidate directly into your DAW (FL Studio, Ableton, Reaper)
+
 ## Testing
 
     python -m pytest -q

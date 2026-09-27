@@ -41,6 +41,9 @@ QPushButton#ModifierBtn:checked { background-color:#0077ED; border-color:#3399FF
 QPushButton#DebleedBtn { background-color:#1E222B; border:1px solid #6B46C1; color:#D6BCFA; font-size:12px; padding:4px 10px; }
 QPushButton#DebleedBtn:checked { background-color:#6B46C1; border-color:#9F7AEA; color:#FFFFFF; }
 QPushButton#PlayBtn { background-color:#00E599; color:#0A0D12; border-radius:14px; min-width:28px; max-width:28px; min-height:28px; max-height:28px; padding:0; }
+QPushButton#ScopeBtn { background-color:#1E222B; border:1px solid #384050; border-radius:4px; padding:5px 12px; font-weight:600; color:#A0AEC0; font-size:12px; }
+QPushButton#ScopeBtn:hover { background-color:#262B36; color:#FFFFFF; border-color:#4B5563; }
+QPushButton#ScopeBtn:checked { background-color:#00E599; border-color:#00E599; color:#0B0E14; font-weight:700; }
 QComboBox { background-color:#2B303C; border:1px solid #3E4656; border-radius:4px; padding:4px 8px; color:#FFFFFF; min-width:100px; }
 QComboBox QAbstractItemView { background-color:#1E222B; selection-background-color:#00E599; selection-color:#0A0D12; }
 QProgressBar { background-color:#13151A; border:1px solid #2B303C; border-radius:3px; text-align:center; font-size:10px; height:12px; }
@@ -51,6 +54,7 @@ QScrollArea { border:none; background-color:transparent; }
 
 class WaveformWidget(QWidget):
     slice_clicked = Signal(int)
+    portion_selected = Signal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -59,26 +63,87 @@ class WaveformWidget(QWidget):
         self.sr = 44100
         self.slices = []
         self.selected_slice_idx = 0
+        self.custom_range = None  # (start_sample, end_sample)
+        self.scope_mode = "whole"  # "whole" or "portion"
+        self.is_dragging = False
+        self.drag_start_x = 0
+        self.drag_current_x = 0
         self.setMouseTracking(True)
 
     def set_audio_and_slices(self, audio_data, sr, slices):
-        self.audio_data, self.sr, self.slices = audio_data, sr, slices
+        self.audio_data = audio_data
+        self.sr = sr
+        self.slices = slices
         self.selected_slice_idx = 0
+        self.custom_range = None
+        self.update()
+
+    def set_scope_mode(self, mode):
+        self.scope_mode = mode
         self.update()
 
     def set_selected_slice(self, idx):
         self.selected_slice_idx = idx
+        self.custom_range = None
+        self.scope_mode = "portion"
+        self.update()
+
+    def set_custom_portion(self, start_sample, end_sample):
+        self.custom_range = (start_sample, end_sample)
+        self.scope_mode = "portion"
         self.update()
 
     def mousePressEvent(self, event):
         if event.button() != Qt.LeftButton or self.audio_data is None:
             return
-        width = max(1, self.width())
-        sample = int(event.pos().x() / width * len(self.audio_data))
+        self.drag_start_x = event.pos().x()
+        self.drag_current_x = event.pos().x()
+        self.is_dragging = True
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self.is_dragging:
+            self.drag_current_x = event.pos().x()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton or not self.is_dragging:
+            return
+        self.is_dragging = False
+        if self.audio_data is None or len(self.audio_data) == 0:
+            return
+
+        w = max(1, self.width())
+        dx = abs(self.drag_current_x - self.drag_start_x)
+
+        if dx > 8:
+            # Custom dragged region
+            x_min = max(0, min(self.drag_start_x, self.drag_current_x))
+            x_max = min(w, max(self.drag_start_x, self.drag_current_x))
+            s_sample = int(x_min / w * len(self.audio_data))
+            e_sample = int(x_max / w * len(self.audio_data))
+            min_samples = max(32, int(self.sr * 0.015))
+            if e_sample - s_sample >= min_samples:
+                self.set_custom_portion(s_sample, e_sample)
+                self.portion_selected.emit(s_sample, e_sample)
+                return
+
+        # Single click without significant drag
+        click_x = self.drag_start_x
+        sample = int(click_x / w * len(self.audio_data))
+
+        # Check if clicked inside a detected slice
         for i, (start, end) in enumerate(self.slices):
             if start <= sample < end:
+                self.set_selected_slice(i)
                 self.slice_clicked.emit(i)
                 return
+
+        # If not inside a detected slice, create a 220ms portion around the click
+        s_sample = max(0, sample)
+        e_sample = min(len(self.audio_data), sample + int(self.sr * 0.22))
+        self.set_custom_portion(s_sample, e_sample)
+        self.portion_selected.emit(s_sample, e_sample)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -94,8 +159,9 @@ class WaveformWidget(QWidget):
         bins = max(1, w)
         step = max(1, len(data) // bins)
         mid = h // 2
-        painter.setPen(QColor("#00E599"))
 
+        # 1) Waveform bars
+        painter.setPen(QColor("#00E599"))
         for x in range(w):
             chunk = data[x * step:min(len(data), (x + 1) * step)]
             if len(chunk) == 0:
@@ -104,13 +170,62 @@ class WaveformWidget(QWidget):
             y = int(amp * (h * 0.42))
             painter.drawLine(x, mid - y, x, mid + y)
 
+        # 2) Slices boundary dividers
+        painter.setPen(QColor(60, 68, 82))
         for i, (start, end) in enumerate(self.slices):
             x1 = int(start / len(data) * w)
-            x2 = int(end / len(data) * w)
-            if i == self.selected_slice_idx:
-                painter.fillRect(x1, 0, max(2, x2 - x1), h, QColor(0, 229, 153, 38))
-            painter.setPen(QColor(80, 90, 105))
             painter.drawLine(x1, 0, x1, h)
+
+        # 3) Scope Highlight
+        if self.scope_mode == "whole":
+            # Highlight entire waveform
+            painter.fillRect(0, 0, w, h, QColor(0, 229, 153, 24))
+            painter.fillRect(0, 0, w, 2, QColor("#00E599"))
+            painter.fillRect(0, h - 2, w, 2, QColor("#00E599"))
+
+            # Badge
+            painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            painter.fillRect(8, 8, 128, 22, QColor("#161A22"))
+            painter.setPen(QColor("#00E599"))
+            painter.drawRect(8, 8, 128, 22)
+            painter.drawText(8, 8, 128, 22, Qt.AlignCenter, "⛶ WHOLE SAMPLE")
+
+        else:
+            # Portion Highlight
+            if self.custom_range is not None:
+                start, end = self.custom_range
+                x1 = int(start / len(data) * w)
+                x2 = int(end / len(data) * w)
+                badge_text = "✂ CUSTOM PORTION"
+            elif self.slices and 0 <= self.selected_slice_idx < len(self.slices):
+                start, end = self.slices[self.selected_slice_idx]
+                x1 = int(start / len(data) * w)
+                x2 = int(end / len(data) * w)
+                badge_text = f"✂ HIT #{self.selected_slice_idx + 1}"
+            else:
+                x1, x2 = 0, 0
+                badge_text = "✂ PORTION"
+
+            bw = max(3, x2 - x1)
+            painter.fillRect(x1, 0, bw, h, QColor(0, 229, 153, 40))
+            painter.fillRect(x1, 0, 2, h, QColor("#00E599"))
+            painter.fillRect(x2 - 1, 0, 2, h, QColor("#00E599"))
+
+            # Badge
+            painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            badge_x = min(max(8, x1), max(8, w - 145))
+            painter.fillRect(badge_x, 8, 136, 22, QColor("#161A22"))
+            painter.setPen(QColor("#00E599"))
+            painter.drawRect(badge_x, 8, 136, 22)
+            painter.drawText(badge_x, 8, 136, 22, Qt.AlignCenter, badge_text)
+
+        # 4) Live Dragging Overlay
+        if self.is_dragging and abs(self.drag_current_x - self.drag_start_x) > 4:
+            dx1 = min(self.drag_start_x, self.drag_current_x)
+            dx2 = max(self.drag_start_x, self.drag_current_x)
+            painter.fillRect(dx1, 0, dx2 - dx1, h, QColor(56, 189, 248, 45))
+            painter.setPen(QColor("#38BDF8"))
+            painter.drawRect(dx1, 0, dx2 - dx1, h)
 
 
 class MatchItemWidget(QFrame):
@@ -261,6 +376,8 @@ class MainWindow(QMainWindow):
         self.sr = 44100
         self.slices = []
         self.current_slice_idx = 0
+        self.custom_portion_range = None
+        self.scope_mode = "whole"  # "whole" or "portion"
         self.current_modifier = None
         self.apply_debleed = False
         self.temp_slice_wav = None
@@ -309,31 +426,63 @@ class MainWindow(QMainWindow):
 
         self.waveform = WaveformWidget()
         self.waveform.slice_clicked.connect(self.select_slice)
+        self.waveform.portion_selected.connect(self.select_custom_portion)
         card_layout.addWidget(self.waveform)
 
         nav = QHBoxLayout()
+        nav.setSpacing(8)
+
+        scope_lbl = QLabel("Compare:")
+        scope_lbl.setStyleSheet("font-weight:bold;color:#A0AEC0;font-size:12px;")
+        nav.addWidget(scope_lbl)
+
+        self.scope_whole_btn = QPushButton("⛶ Whole Sample")
+        self.scope_whole_btn.setObjectName("ScopeBtn")
+        self.scope_whole_btn.setCheckable(True)
+        self.scope_whole_btn.setChecked(True)
+        self.scope_whole_btn.setToolTip("Compare the complete audio sample with full decay & sustain (Shortcut: W)")
+        self.scope_whole_btn.clicked.connect(lambda: self.set_scope_mode("whole"))
+        nav.addWidget(self.scope_whole_btn)
+
+        self.scope_portion_btn = QPushButton("✂ Portion / Slice")
+        self.scope_portion_btn.setObjectName("ScopeBtn")
+        self.scope_portion_btn.setCheckable(True)
+        self.scope_portion_btn.setChecked(False)
+        self.scope_portion_btn.setToolTip("Compare an isolated hit slice or custom dragged region (Shortcut: W)")
+        self.scope_portion_btn.clicked.connect(lambda: self.set_scope_mode("portion"))
+        nav.addWidget(self.scope_portion_btn)
+
+        nav.addSpacing(14)
+
         self.prev_btn = QPushButton("◀")
+        self.prev_btn.setToolTip("Previous detected hit (Left arrow)")
         self.prev_btn.clicked.connect(self.prev_slice)
-        self.next_btn = QPushButton("▶")
-        self.next_btn.clicked.connect(self.next_slice)
         nav.addWidget(self.prev_btn)
+
         self.slice_lbl = QLabel("No audio loaded")
         self.slice_lbl.setStyleSheet("font-weight:bold;color:#00E599;")
         nav.addWidget(self.slice_lbl)
+
+        self.next_btn = QPushButton("▶")
+        self.next_btn.setToolTip("Next detected hit (Right arrow)")
+        self.next_btn.clicked.connect(self.next_slice)
         nav.addWidget(self.next_btn)
-        nav.addSpacing(12)
 
-        play = QPushButton("Play Hit (Space)")
-        play.clicked.connect(self.play_current_slice)
-        nav.addWidget(play)
+        nav.addSpacing(14)
 
-        play_full = QPushButton("Play Full (R)")
-        play_full.clicked.connect(self.play_full)
-        nav.addWidget(play_full)
+        self.play_btn = QPushButton("Play Active (Space)")
+        self.play_btn.setToolTip("Audition the active comparison target (Spacebar)")
+        self.play_btn.clicked.connect(self.play_active_target)
+        nav.addWidget(self.play_btn)
+
+        self.play_full_btn = QPushButton("Play Full (R)")
+        self.play_full_btn.setToolTip("Audition full source audio (R key)")
+        self.play_full_btn.clicked.connect(self.play_full)
+        nav.addWidget(self.play_full_btn)
 
         nav.addStretch()
 
-        self.match_btn = QPushButton("MATCH SELECTED HIT")
+        self.match_btn = QPushButton("MATCH WHOLE SAMPLE")
         self.match_btn.setObjectName("MatchSliceBtn")
         self.match_btn.clicked.connect(self._rerun)
         nav.addWidget(self.match_btn)
@@ -417,6 +566,42 @@ class MainWindow(QMainWindow):
         except sqlite3.Error:
             pass
 
+    def set_scope_mode(self, mode):
+        self.scope_mode = mode
+        is_whole = (mode == "whole")
+        self.scope_whole_btn.setChecked(is_whole)
+        self.scope_portion_btn.setChecked(not is_whole)
+        self.waveform.set_scope_mode(mode)
+
+        self.prev_btn.setEnabled(not is_whole)
+        self.next_btn.setEnabled(not is_whole)
+
+        if is_whole:
+            self.match_btn.setText("MATCH WHOLE SAMPLE")
+            if self.full_audio_data is not None:
+                dur_s = len(self.full_audio_data) / self.sr
+                self.slice_lbl.setText(f"Whole Sample ({dur_s:.2f}s)")
+            else:
+                self.slice_lbl.setText("Whole Sample")
+        else:
+            self.match_btn.setText("MATCH SELECTED PORTION")
+            if self.custom_portion_range is not None:
+                s, e = self.custom_portion_range
+                self.slice_lbl.setText(f"Custom Portion ({s/self.sr:.2f}s–{e/self.sr:.2f}s)")
+            elif self.slices:
+                s, e = self.slices[self.current_slice_idx]
+                self.slice_lbl.setText(
+                    f"Hit #{self.current_slice_idx + 1}/{len(self.slices)} ({s/self.sr:.2f}s–{e/self.sr:.2f}s)"
+                )
+            else:
+                self.slice_lbl.setText("Portion")
+
+        self._rerun()
+
+    def toggle_scope_mode(self):
+        new_mode = "portion" if self.scope_mode == "whole" else "whole"
+        self.set_scope_mode(new_mode)
+
     def load_reference(self, path):
         try:
             self.status.setText(f"Analysing {os.path.basename(path)}…")
@@ -426,8 +611,22 @@ class MainWindow(QMainWindow):
             self.current_ref_path = path
             self.slices = detect_all_onsets(data, sr)
             self.current_slice_idx = 0
+            self.custom_portion_range = None
+
+            if self.slices:
+                s, e = self.slices[0]
+                self.current_slice_audio = self.full_audio_data[s:e]
+            else:
+                self.current_slice_audio = self.full_audio_data
+
             self.waveform.set_audio_and_slices(data, sr, self.slices)
-            self.select_slice(0)
+
+            # Smart initial scope:
+            # Single hit one-shots (<= 1.2s and at most 1 onset) default to whole sample.
+            # Multi-hit loops or long stems default to portion (Hit #1).
+            dur_s = len(data) / sr
+            initial_mode = "whole" if (dur_s <= 1.2 and len(self.slices) <= 1) else "portion"
+            self.set_scope_mode(initial_mode)
         except Exception as exc:
             QMessageBox.critical(self, "Could not load audio", str(exc))
 
@@ -435,18 +634,40 @@ class MainWindow(QMainWindow):
         if not self.slices or not (0 <= idx < len(self.slices)):
             return
         self.current_slice_idx = idx
-        self.waveform.set_selected_slice(idx)
+        self.custom_portion_range = None
         start, end = self.slices[idx]
         self.current_slice_audio = self.full_audio_data[start:end]
-        self.slice_lbl.setText(
-            f"Hit #{idx + 1}/{len(self.slices)} "
-            f"({start/self.sr:.2f}s–{end/self.sr:.2f}s)"
-        )
-        self._rerun()
+        self.waveform.set_selected_slice(idx)
+        self.set_scope_mode("portion")
+
+    def select_custom_portion(self, start_sample, end_sample):
+        if self.full_audio_data is None:
+            return
+        start = max(0, min(start_sample, len(self.full_audio_data) - 1))
+        end = min(len(self.full_audio_data), max(end_sample, start + int(self.sr * 0.01)))
+        self.custom_portion_range = (start, end)
+        self.current_slice_audio = self.full_audio_data[start:end]
+        self.waveform.set_custom_portion(start, end)
+        self.set_scope_mode("portion")
 
     def _rerun(self):
-        if self.current_slice_audio is None:
+        if self.full_audio_data is None:
             return
+
+        if self.scope_mode == "whole":
+            target = (
+                self.current_ref_path
+                if self.current_ref_path and os.path.exists(self.current_ref_path)
+                else self.full_audio_data
+            )
+        else:
+            if self.current_slice_audio is None:
+                if self.slices:
+                    s, e = self.slices[self.current_slice_idx]
+                    self.current_slice_audio = self.full_audio_data[s:e]
+                else:
+                    self.current_slice_audio = self.full_audio_data
+            target = self.current_slice_audio
 
         category = self.cat_combo.currentText().lower()
         category = None if category == "auto detect" else category
@@ -465,20 +686,21 @@ class MainWindow(QMainWindow):
 
         try:
             matches, ref = match_sample(
-                self.current_slice_audio,
+                target,
                 category=category,
                 top_k=25,
                 modifier=modifier,
                 apply_debleed=self.focus_btn.isChecked(),
                 sample_type=sample_type,
             )
+            mode_tag = "WHOLE" if self.scope_mode == "whole" else "PORTION"
             self.role_metric.setText(
-                f"Role: {ref['category'].upper()} "
-                f"({ref['category_confidence']*100:.0f}%)"
+                f"[{mode_tag}] {ref['category'].upper()} ({ref['category_confidence']*100:.0f}%)"
             )
             self._populate(matches)
             self.status.setText(
-                f"{len(matches)} candidates • {ref['category'].upper()} reference"
+                f"{len(matches)} candidates • {mode_tag} reference: {ref['category'].upper()} "
+                f"({ref['duration_ms']:.0f}ms duration, {ref['decay_ms']:.0f}ms decay)"
             )
         except Exception as exc:
             self.status.setText(f"Match error: {exc}")
@@ -494,7 +716,11 @@ class MainWindow(QMainWindow):
                 rank - 1, MatchItemWidget(rank, score, cand, sims)
             )
 
-    def play_current_slice(self):
+    def play_active_target(self):
+        if self.scope_mode == "whole":
+            self.play_full()
+            return
+
         if self.current_slice_audio is None:
             return
         try:
@@ -510,6 +736,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.status.setText(f"Playback error: {exc}")
 
+    def play_current_slice(self):
+        self.play_active_target()
+
     def play_full(self):
         if self.current_ref_path:
             try:
@@ -521,15 +750,19 @@ class MainWindow(QMainWindow):
 
     def prev_slice(self):
         if self.slices:
-            self.select_slice((self.current_slice_idx - 1) % len(self.slices))
+            idx = (self.current_slice_idx - 1) % len(self.slices)
+            self.select_slice(idx)
 
     def next_slice(self):
         if self.slices:
-            self.select_slice((self.current_slice_idx + 1) % len(self.slices))
+            idx = (self.current_slice_idx + 1) % len(self.slices)
+            self.select_slice(idx)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Space:
-            self.play_current_slice()
+            self.play_active_target()
+        elif event.key() == Qt.Key_W:
+            self.toggle_scope_mode()
         elif event.key() == Qt.Key_Left:
             self.prev_slice()
         elif event.key() == Qt.Key_Right:

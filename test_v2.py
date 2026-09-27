@@ -87,3 +87,34 @@ def test_indexer_insert_and_migration():
         assert row["is_loop"] == 0
         assert row["band_profile_json"] != "[]"
         assert row["attack_ratio"] > 0.0
+
+
+def test_whole_vs_portion_matching():
+    import soundfile as sf
+    from matcher import match_sample
+
+    with tempfile.TemporaryDirectory() as d:
+        # Create a long 808-like tone: 0.8s long with gradual decay
+        t = np.arange(int(0.80 * TARGET_SR), dtype=np.float32) / TARGET_SR
+        audio_808 = (np.sin(2 * np.pi * 55.0 * t) * np.exp(-t * 3.0)).astype(np.float32)
+
+        wav_path = os.path.join(d, "sample_808.wav")
+        sf.write(wav_path, audio_808, TARGET_SR)
+
+        db_path = os.path.join(d, "drums.db")
+        from indexer import index_folder
+        index_folder(d, db_path=db_path)
+
+        # Match whole sample
+        matches_whole, ref_whole = match_sample(wav_path, db_path=db_path)
+        assert ref_whole["duration_ms"] >= 750.0
+        assert ref_whole["decay_ms"] > 150.0
+        assert len(matches_whole) >= 1
+        assert matches_whole[0][0] >= 0.99  # Self-match is ~100%
+
+        # Match short portion (first 100ms)
+        matches_portion, ref_portion = match_sample(
+            wav_path, db_path=db_path, time_range=(0.0, 0.10)
+        )
+        assert ref_portion["duration_ms"] <= 105.0
+        assert ref_portion["decay_ms"] < ref_whole["decay_ms"]
