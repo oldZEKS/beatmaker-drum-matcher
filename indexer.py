@@ -12,7 +12,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from audio_features import extract_features
+from audio_features import FEATURE_VERSION, extract_features
 
 
 DB_NAME = "drums.db"
@@ -87,9 +87,9 @@ def init_db(db_path=DB_NAME):
     return conn
 
 
-def get_existing_paths(conn):
+def get_existing_paths(conn, min_version=FEATURE_VERSION):
     cur = conn.cursor()
-    cur.execute("SELECT path FROM samples")
+    cur.execute("SELECT path FROM samples WHERE COALESCE(feature_version, 1) >= ?", (min_version,))
     return {row[0] for row in cur.fetchall()}
 
 
