@@ -62,3 +62,28 @@ def test_similarity_exposes_producer_dimensions():
     assert score["sim_body"] >= 0.0
     assert score["sim_tail"] >= 0.0
     assert score["sim_mel24"] >= 0.0
+
+
+def test_indexer_insert_and_migration():
+    import soundfile as sf
+    from indexer import index_folder
+
+    with tempfile.TemporaryDirectory() as d:
+        audio_dir = os.path.join(d, "samples")
+        os.makedirs(audio_dir)
+        wav_path = os.path.join(audio_dir, "test_kick.wav")
+        sf.write(wav_path, _tone(60, 0.25), TARGET_SR)
+
+        db_path = os.path.join(d, "drums.db")
+        count = index_folder(audio_dir, db_path=db_path)
+        assert count == 1
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        row = dict(conn.execute("SELECT * FROM samples WHERE filename='test_kick.wav'").fetchone())
+        conn.close()
+
+        assert row["feature_version"] == 2
+        assert row["is_loop"] == 0
+        assert row["band_profile_json"] != "[]"
+        assert row["attack_ratio"] > 0.0

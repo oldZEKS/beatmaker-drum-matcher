@@ -166,18 +166,18 @@ def index_folder(folder_path, kit_name=None, db_path=DB_NAME, force=False, num_w
     batch = []
     start = time.time()
 
-    sql = """
-        INSERT OR REPLACE INTO samples (
-            path, filename, kit_name, category, onset_time_ms, attack_time_ms, lat,
-            crest_db, f0, f_sub, f_top, pitch_drop_st, f0_conf,
-            att_low, att_mid, att_high, sus_low, sus_mid, sus_high,
-            mel24_json, centroid, noise_ratio, decay_ms, duration_ms,
-            feature_version, is_loop, rms_db, band_profile_json, rolloff,
-            spectral_flatness, category_confidence, category_probs_json,
-            path_category, attack_ratio, body_ratio, tail_ratio,
-            transient_rms, body_rms, tail_rms
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """
+    cols = [
+        "path", "filename", "kit_name", "category", "onset_time_ms", "attack_time_ms", "lat",
+        "crest_db", "f0", "f_sub", "f_top", "pitch_drop_st", "f0_conf",
+        "att_low", "att_mid", "att_high", "sus_low", "sus_mid", "sus_high",
+        "mel24_json", "centroid", "noise_ratio", "decay_ms", "duration_ms",
+        "feature_version", "is_loop", "rms_db", "band_profile_json", "rolloff",
+        "spectral_flatness", "category_confidence", "category_probs_json",
+        "path_category", "attack_ratio", "body_ratio", "tail_ratio",
+        "transient_rms", "body_rms", "tail_rms",
+    ]
+    placeholders = ",".join("?" for _ in cols)
+    sql = f"INSERT OR REPLACE INTO samples ({','.join(cols)}) VALUES ({placeholders})"
 
     with ThreadPoolExecutor(max_workers=max(1, int(num_workers))) as executor:
         for i, feats in enumerate(executor.map(worker_extract, items), 1):
