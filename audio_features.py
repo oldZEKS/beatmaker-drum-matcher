@@ -477,7 +477,7 @@ def percussive_focus(audio, sr, strength=0.72):
     noverlap = 768
     f, t, z = signal.stft(
         audio, fs=sr, nperseg=nperseg, noverlap=noverlap,
-        boundary=None, padded=False
+        boundary="zeros", padded=True
     )
     mag = np.abs(z)
     phase = np.angle(z)
@@ -495,7 +495,7 @@ def percussive_focus(audio, sr, strength=0.72):
     _, restored = signal.istft(
         focused * np.exp(1j * phase),
         fs=sr, nperseg=nperseg, noverlap=noverlap,
-        input_onesided=True, boundary=None
+        input_onesided=True, boundary=True
     )
 
     if len(restored) < len(audio):

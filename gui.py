@@ -96,14 +96,16 @@ class WaveformWidget(QWidget):
     def mousePressEvent(self, event):
         if event.button() != Qt.LeftButton or self.audio_data is None:
             return
-        self.drag_start_x = event.pos().x()
-        self.drag_current_x = event.pos().x()
+        x = int(event.position().x()) if hasattr(event, "position") else event.pos().x()
+        self.drag_start_x = x
+        self.drag_current_x = x
         self.is_dragging = True
         self.update()
 
     def mouseMoveEvent(self, event):
         if self.is_dragging:
-            self.drag_current_x = event.pos().x()
+            x = int(event.position().x()) if hasattr(event, "position") else event.pos().x()
+            self.drag_current_x = x
             self.update()
 
     def mouseReleaseEvent(self, event):
@@ -321,13 +323,18 @@ class MatchItemWidget(QFrame):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.drag_start_pos = event.pos()
+            self.drag_start_pos = (
+                event.position().toPoint() if hasattr(event, "position") else event.pos()
+            )
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if not (event.buttons() & Qt.LeftButton) or self.drag_start_pos is None:
             return
-        if (event.pos() - self.drag_start_pos).manhattanLength() < QApplication.startDragDistance():
+        curr_pos = (
+            event.position().toPoint() if hasattr(event, "position") else event.pos()
+        )
+        if (curr_pos - self.drag_start_pos).manhattanLength() < QApplication.startDragDistance():
             return
 
         drag = QDrag(self)
